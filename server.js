@@ -10,6 +10,24 @@ const FILE = process.env.DATA_FILE || './plans.json';
 const KEEP = 14 * 864e5; // 24data terms: don't keep identifiable data longer than 14 days
 let plans = {};
 const acft = { main: null, event: null };
+const cal = {};            // ICAO -> [[x,y], ...] parked positions of pilots who filed a plan from that airport (no names kept)
+const calSeen = new Set();
+function sample(d) {
+  for (const k in d) {
+    const c = d[k];
+    if (!c || !c.isOnGround || !(c.speed < 2) || !c.position || !c.playerName) continue;
+    const p = plans[String(c.playerName).toLowerCase()];
+    if (!p || p.server !== 'main' || !p.departing || Date.now() - p.at > 45 * 60e3) continue;
+    const id = p.robloxName + p.at;
+    if (calSeen.has(id)) continue;
+    calSeen.add(id);
+    const a = cal[p.departing] || (cal[p.departing] = []);
+    a.push([Math.round(c.position.x), Math.round(c.position.y)]);
+    if (a.length > 40) a.shift();
+  }
+}
+const med = (v) => { const s = [...v].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+setInterval(() => calSeen.clear(), 3600e3);
 try { plans = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch {}
 const save = () => { try { fs.writeFileSync(FILE, JSON.stringify(plans)); } catch {} };
 setInterval(() => { const n = Date.now(); for (const k in plans) if (n - plans[k].at > KEEP) delete plans[k]; save(); }, 3600e3);
@@ -19,7 +37,7 @@ function connect() {
   ws.on('message', (m) => {
     try {
       const e = JSON.parse(m);
-      if (e.t === 'ACFT_DATA') acft.main = { d: e.d, at: Date.now() };
+      if (e.t === 'ACFT_DATA') { acft.main = { d: e.d, at: Date.now() }; sample(e.d); }
       else if (e.t === 'EVENT_ACFT_DATA') acft.event = { d: e.d, at: Date.now() };
       else if ((e.t === 'FLIGHT_PLAN' || e.t === 'EVENT_FLIGHT_PLAN') && e.d && e.d.robloxName) {
         plans[String(e.d.robloxName).toLowerCase()] = { ...e.d, server: e.t === 'FLIGHT_PLAN' ? 'main' : 'event', at: Date.now() };
@@ -39,6 +57,12 @@ http.createServer((req, res) => {
   if (u.pathname === '/plan') {
     const names = (u.searchParams.get('names') || '').toLowerCase().split(',').filter(Boolean);
     return res.end(JSON.stringify(names.map((n) => plans[n]).find(Boolean) || null));
+  }
+  if (u.pathname === '/map') {
+    const c = {}, cs = {};
+    for (const i in cal) if (cal[i].length) c[i] = { x: med(cal[i].map((p) => p[0])), y: med(cal[i].map((p) => p[1])), n: cal[i].length };
+    for (const k in plans) cs[k] = plans[k].callsign || plans[k].realcallsign || '';
+    return res.end(JSON.stringify({ cal: c, cs }));
   }
   if (u.pathname === '/recent') return res.end(JSON.stringify(Object.values(plans).sort((a, b) => b.at - a.at).slice(0, 8)));
   if (u.pathname === '/acft') {
