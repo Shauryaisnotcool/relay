@@ -11,7 +11,8 @@ const FILE = process.env.DATA_FILE || './plans.json';
 const KEEP = 14 * 864e5; // 24data terms: don't keep identifiable data longer than 14 days
 let plans = {};
 let lb = {};            // pilot -> { 'YYYY-MM-DD': airborne seconds }  (kept 14 days)
-const dev = {}, reqs = {}, links = {}, rl = {};   // live devices, co-pilot requests, active links, rate limits
+const dev = {}, reqs = {}, links = {}, rl = {};
+const ids = {}, byName = {}, live = {}, vcs = {}, joinq = [];   // discord id <-> roblox name, live pilot state, aircraft voice channels, pending guild joins   // live devices, co-pilot requests, active links, rate limits
 const park = {}, parkSeen = new Set(), tickAt = { main: 0, event: 0 };
 const acft = { main: null, event: null };
 const cal = {};            // ICAO -> [[x,y], ...] parked positions of pilots who filed a plan from that airport (no names kept)
@@ -39,6 +40,8 @@ setInterval(() => {
   for (const k in reqs) if (n - reqs[k].at > 600e3) delete reqs[k];
   for (const k in links) if (n - links[k].at > 12 * 36e5) delete links[k];
   for (const k in rl) if (n - rl[k] > 600e3) delete rl[k];
+  for (const d in ids) if (n - ids[d].t > 30 * 864e5) { delete byName[ids[d].name.toLowerCase()]; delete ids[d]; }
+  for (const k in live) if (n - live[k].t > 300e3) delete live[k];
   save();
 }, 3600e3);
 setInterval(() => save(), 60e3);
@@ -61,6 +64,10 @@ function cp(b) {
   const name = String(b.name || ''), nl = name.toLowerCase(), now = Date.now(); let extra = {}, st = 200;
   if (!RE.test(name)) return [{ error: 'bad name' }, 400];
   dev[b.dev || nl] = { name, t: now };
+  const disc = String(b.disc || '');
+  if (/^\d{15,22}$/.test(disc)) { ids[disc] = { name, t: now }; byName[nl] = disc; }
+  const cur = b.cur && /^[A-Z0-9_]{3,14}$/.test(String(b.cur.key)) && /^\d{15,22}$/.test(String(b.cur.chan || '')) ? { key: b.cur.key, chan: String(b.cur.chan), freq: String(b.cur.freq || '').slice(0, 8) } : null;
+  live[nl] = { phase: String(b.phase || '').slice(0, 20), cur, t: now };
   if (b.act === 'req') {
     const to = String(b.to || '').trim(), tl = to.toLowerCase();
     const k1 = 'i|' + b.ip + '|' + tl, k2 = 'd|' + b.dev + '|' + tl, last = Math.max(rl[k1] || 0, rl[k2] || 0);
@@ -76,9 +83,13 @@ function cp(b) {
   } else if (b.act === 'end') {
     if (b.to) { const t = String(b.to).toLowerCase(); if (links[t] && links[t].captain.toLowerCase() === nl) delete links[t]; } else delete links[nl];
   }
-  const lk = links[nl], out = Object.values(reqs).filter((r) => r.fromL === nl && now - r.at < 300e3).sort((a, c) => c.at - a.at)[0];
+  const lk = links[nl], cap = lk && now - lk.at < 12 * 36e5 ? lk.captain : null;
+  const mine = vcs[disc], capD = cap && byName[cap.toLowerCase()], capVc = capD ? vcs[capD] : null, vv = mine && mine.joined ? mine : capVc && capVc.joined ? capVc : null;
+  let follow = null;
+  if (cap) { const L = live[cap.toLowerCase()]; if (L && now - L.t < 25000) follow = L.cur ? { key: L.cur.key, chan: L.cur.chan } : vv ? { key: 'AIRCRAFT', chan: vv.id } : null; }
+  const out = Object.values(reqs).filter((r) => r.fromL === nl && now - r.at < 300e3).sort((a, c) => c.at - a.at)[0];
   return [{
-    ...extra, online: online().length,
+    ...extra, online: online().length, vc: vv ? { id: vv.id, name: vv.name } : null, follow,
     incoming: Object.values(reqs).filter((r) => r.to === nl && r.st === 'pending' && now - r.at < 120e3).map((r) => ({ id: r.id, from: r.from })),
     watch: lk && now - lk.at < 12 * 36e5 ? lk.captain : null,
     sharing: Object.values(links).filter((v) => v.captain.toLowerCase() === nl).map((v) => v.copilot),
@@ -86,8 +97,8 @@ function cp(b) {
   }, st];
 }
 const body = (req) => new Promise((ok) => { let s = ''; req.on('data', (c) => { s += c; if (s.length > 2e4) req.destroy(); }); req.on('end', () => { try { ok(JSON.parse(s || '{}')); } catch { ok({}); } }); });
-try { const r = JSON.parse(fs.readFileSync(FILE, 'utf8')); if (r && r.plans) { plans = r.plans; lb = r.lb || {}; } else plans = r || {}; } catch {}
-const save = () => { try { fs.writeFileSync(FILE, JSON.stringify({ plans, lb })); } catch {} };
+try { const r = JSON.parse(fs.readFileSync(FILE, 'utf8')); if (r && r.plans) { plans = r.plans; lb = r.lb || {}; Object.assign(ids, r.ids || {}); Object.assign(vcs, r.vcs || {}); for (const d in ids) byName[ids[d].name.toLowerCase()] = d; } else plans = r || {}; } catch {}
+const save = () => { try { fs.writeFileSync(FILE, JSON.stringify({ plans, lb, ids, vcs })); } catch {} };
 const day = () => new Date().toISOString().slice(0, 10);
 const online = () => { const n = Date.now(); return Object.values(dev).filter((d) => n - d.t < 45000); };
 setInterval(() => { const n = Date.now(); for (const k in plans) if (n - plans[k].at > KEEP) delete plans[k]; save(); }, 3600e3);
@@ -115,6 +126,27 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   res.setHeader('Content-Type', 'application/json');
   if (req.method === 'POST' && u.pathname === '/cp') { const [o, st] = cp(await body(req)); res.statusCode = st; return res.end(JSON.stringify(o)); }
+  if (req.method === 'POST' && ['/vcset', '/joinq', '/bot/ack'].includes(u.pathname)) {
+    const b = await body(req), now = Date.now();
+    if (u.pathname === '/vcset') {
+      const d = String(b.disc || ''); if (!/^\d{15,22}$/.test(d)) { res.statusCode = 400; return res.end('{}'); }
+      if (!b.id) delete vcs[d]; else vcs[d] = { id: String(b.id), name: String(b.name || '').slice(0, 100), joined: !!b.joined || !!(vcs[d] && vcs[d].id === String(b.id) && vcs[d].joined), at: now };
+    } else if (u.pathname === '/joinq') {
+      const d = String(b.id || ''); if (/^\d{15,22}$/.test(d) && String(b.token || '').length < 200) { const i = joinq.findIndex((x) => x.id === d); if (i >= 0) joinq.splice(i, 1); joinq.push({ id: d, token: String(b.token), name: String(b.name || ''), at: now }); if (joinq.length > 500) joinq.shift(); }
+    } else { const i = joinq.findIndex((x) => x.id === String(b.id)); if (i >= 0) joinq.splice(i, 1); }
+    return res.end('{"ok":true}');
+  }
+  if (u.pathname === '/bot/joins') { const n = Date.now(); for (let i = joinq.length - 1; i >= 0; i--) if (n - joinq[i].at > 600e3) joinq.splice(i, 1); return res.end(JSON.stringify(joinq)); }
+  if (u.pathname === '/vcs') return res.end(JSON.stringify(Object.entries(vcs).map(([disc, v]) => ({ disc, ...v }))));
+  if (u.pathname === '/who') {
+    const i = ids[u.searchParams.get('disc')]; if (!i) return res.end('{}');
+    const nl = i.name.toLowerCase(), now = Date.now(), p = plans[nl], L = live[nl], fresh = !!(L && now - L.t < 25000), lk = links[nl];
+    const seen = (a) => a && now - a.at < 20000 && Object.values(a.d || {}).some((c) => String(c.playerName || '').toLowerCase() === nl);
+    return res.end(JSON.stringify({ name: i.name, online: fresh, seated: !!(seen(acft.main) || seen(acft.event)), phase: fresh ? L.phase : '', cur: fresh ? L.cur : null,
+      plan: p ? { callsign: p.callsign || p.realcallsign, departing: p.departing, arriving: p.arriving, flightlevel: p.flightlevel, at: p.at } : null,
+      copilots: Object.values(links).filter((v) => v.captain.toLowerCase() === nl).map((v) => byName[v.copilot.toLowerCase()]).filter(Boolean),
+      watch: lk && now - lk.at < 12 * 36e5 ? byName[lk.captain.toLowerCase()] || null : null }));
+  }
   if (u.pathname === '/lb') {
     const cut = Date.now() - 15 * 864e5;
     const rows = Object.entries(lb).map(([name, days]) => ({ name, secs: Math.round(Object.entries(days).filter(([d]) => Date.parse(d) >= cut).reduce((a, [, v]) => a + v, 0)) })).filter((r) => r.secs > 0).sort((a, c) => c.secs - a.secs).slice(0, 20);
